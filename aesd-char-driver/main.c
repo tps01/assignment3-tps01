@@ -16,9 +16,11 @@
 #include <linux/printk.h>
 #include <linux/types.h>
 #include <linux/cdev.h>
-#include <linux/fs.h> // file_operations
+#include <linux/fs.h> // file_operations, fixed size llseek
 #include <linux/slab.h>
 #include "aesdchar.h"
+#include "aesd_ioctl.h"
+
 
 int aesd_major =   0; // use dynamic major
 int aesd_minor =   0;
@@ -141,12 +143,97 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
     PDEBUG("Unlocked mutex for write\n");
     return retval;
 }
+
+
+/*
+ * ioctl() based on scull implementation
+ */
+
+long aesd_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+{
+
+	int err = 0, tmp;
+	int retval = 0;
+    
+
+	if (_IOC_TYPE(cmd) != AESD_IOC_MAGIC) return -ENOTTY;
+	if (_IOC_NR(cmd) > AESD_IOC_MAGIC) return -ENOTTY;
+
+	if (_IOC_DIR(cmd) & _IOC_READ)
+		err = !access_ok_wrapper(VERIFY_WRITE, (void __user *)arg, _IOC_SIZE(cmd));
+	else if (_IOC_DIR(cmd) & _IOC_WRITE)
+		err =  !access_ok_wrapper(VERIFY_READ, (void __user *)arg, _IOC_SIZE(cmd));
+	if (err) return -EFAULT;
+
+	switch(cmd) {
+	  case AESDCHAR_IOCSEEKTO:
+        struct aesd_dev *dev = filp->private_data;
+        struct aesd_circular_buffer *buffer = &dev->buffer;
+        struct aesd_seekto *seekto;
+        mutex_lock(&dev->lock);
+        seekto = (struct aesd_seekto *)kmalloc(sizeof(struct aesd_seekto), GFP_KERNEL);
+        copy_from_user(seekto, &arg, sizeof(struct aesd_seekto));
+        PDEBUG("our seekto cmd: %d, offset: %d\n", seekto->write_cmd, seekto->write_cmd_offset);
+
+
+        kfree(seekto);
+        mutex_unlock(&dev->lock);
+		break;
+	  default:  /* redundant, as cmd was checked against MAXNR */
+		return -ENOTTY;
+	}
+	return retval;
+
+}
+
+
+loff_t aesd_llseek(struct file *filp, loff_t off, int whence)
+{
+	struct aesd_dev *dev = filp->private_data;
+    struct aesd_circular_buffer *buffer = &dev->buffer;
+    struct aesd_buffer_entry *temp_entry;
+	loff_t newpos;
+    size_t offset_return;
+    loff_t f_pos = 0;
+    size_t total_size = 0;
+
+    //lock device
+    mutex_lock(&dev->lock);
+    PDEBUG("Locked mutex for llseek\n");
+    //get size of each entry
+    int i; // declrating i up here because of c99 features being unsupported
+    for (i=0; i < AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED; i++) {
+        temp_entry = aesd_circular_buffer_find_entry_offset_for_fpos(buffer, f_pos, &offset_return);
+        if (temp_entry) {
+            PDEBUG("Found entry with offset %ld\n", offset_return);
+            total_size += temp_entry->size;
+            f_pos += temp_entry->size;
+            PDEBUG("New total size and offset %ld, %ld\n", total_size, f_pos);
+        } else {
+            return -EINVAL; // seek too far out, the entry was null
+        }
+    }
+    //do the thing
+	newpos = fixed_size_llseek(filp, off, whence, total_size);
+    //unlock
+    mutex_unlock(&dev->lock);
+    PDEBUG("unlocked mutex after llseek\n");
+	if (newpos < 0) return -EINVAL;
+	//filp->f_pos = newpos; I assume fixed size llseek does this internally
+    PDEBUG("New file position: %ld\n", newpos);
+	return newpos;
+}
+
+
+
 struct file_operations aesd_fops = {
     .owner =    THIS_MODULE,
     .read =     aesd_read,
     .write =    aesd_write,
     .open =     aesd_open,
     .release =  aesd_release,
+    .llseek =   aesd_llseek,
+    .unlocked_ioctl = aesd_ioctl,
 };
 
 static int aesd_setup_cdev(struct aesd_dev *dev)
