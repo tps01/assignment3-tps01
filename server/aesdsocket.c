@@ -1,4 +1,6 @@
 #include "aesdsocket.h"
+#include "../aesd-char-driver/aesd_ioctl.h"
+
 
 bool non_interrupted = true;
 int fd;
@@ -12,16 +14,20 @@ int log_file;
 
 
 int sock_recv(int log_file, int client_fd){
-    log_file = open(LOG_FILE, O_CREAT | O_RDWR | O_NONBLOCK, 0777);
-    if (log_file == -1) {
-        perror("open");
-        syslog(LOG_ERR, "Could not access %s\n", LOG_FILE);
-        return -1;
-    }
-
     char buf[1024];
     memset(buf,0,1024);
     int num_bytes = 1024;
+    //check if received data was the ioctl command
+    //just use a posix regex for simplicity
+    regex_t regex;
+    //NOTE: this will technically match more than :X:Y,
+    //but for the sake of this assignment it doesn't really matter
+    int rc = regcomp(&regex, "AESDCHAR_IOCSEEKTO:*:*", REG_EXTENDED);
+    if (rc != 0) {
+        perror("regcomp");
+        return -1;
+    }
+
     while (num_bytes == 1024){
         int num_bytes = recv(client_fd, buf, 1024, MSG_DONTWAIT);
         if (num_bytes == -1 && errno == EAGAIN ){
@@ -29,6 +35,7 @@ int sock_recv(int log_file, int client_fd){
         }
         else if (num_bytes == -1){
             perror("recv");
+            syslog(LOG_DEBUG, "Closing log file\n");
             if (close(log_file) == -1){
                 perror("close");
                 syslog(LOG_ERR, "Could not close log file\n");
@@ -40,49 +47,85 @@ int sock_recv(int log_file, int client_fd){
             return 0;
         }
         syslog(LOG_DEBUG, "num_bytes: %d\n",num_bytes); 
-        char *pos = (char *)memchr(buf,'\n',sizeof(buf));
-        int delim = 0;
-        if (pos != NULL){ // \n in string, so do stuff
-            delim = strcspn(buf,"\n");
-            char enter = '\n';
-            strncat(buf, &enter, sizeof(buf) - strlen(buf) - 1);
-        } else {
-            delim = num_bytes -1; // 1023
-        }
+
+        // char *pos = (char *)memchr(buf,'\n',sizeof(buf));
+        // int delim = 0;
+        // if (pos != NULL){ // \n in string, so do stuff
+        //     delim = strcspn(buf,"\n");
+        //     char enter = '\n';
+        //     strncat(buf, &enter, sizeof(buf) - strlen(buf) - 1);
+        // } else {
+        //     delim = num_bytes -1; // 1023
+        // }
         
-        int rc = write(log_file, buf, delim+1);
-        if (rc == -1){
-            perror("write");
+
+        buf[num_bytes] = '\0';
+        
+        char *regbuf = strdup(buf);
+        syslog(LOG_DEBUG, "buffer passed to regexec: %s\n", regbuf); 
+        rc = regexec(&regex, regbuf, 0, NULL, 0);
+        
+        syslog(LOG_DEBUG, "regexec return value: %d\n", rc); 
+        if (rc == 0){ // matches ioctl string
+            syslog(LOG_DEBUG, "AESDCHAR_IOCSEEKTO:X:Y in received data!\n");
+            // Do the ioctl command
+            struct aesd_seekto seekto;
+            //0123456789 123456789 1
+            //AESDCHAR_IOCSEEKTO:X:Y
+            //X=[19], Y=[21]
+            seekto.write_cmd = regbuf[19] - '0'; //ascii magic to get the proper int
+            seekto.write_cmd_offset = regbuf[21] - '0';
+            syslog(LOG_DEBUG, "seekto X: %d, Y: %d\n", seekto.write_cmd, seekto.write_cmd_offset);
+            rc = ioctl(log_file, AESDCHAR_IOCSEEKTO, &seekto);
+            if (rc != 0){
+                perror("ioctl");
+                syslog(LOG_DEBUG, "Closing log file\n");
+                if (close(log_file) == -1){
+                    perror("close");
+                    syslog(LOG_ERR, "Could not close log file\n");
+                    free(regbuf);
+                    return -1;
+                }
+            }
+            free(regbuf);
+            return 2; // flag that we need to do ioctl stuff
+        } else if (rc == REG_NOMATCH){
+            rc = write(log_file, buf, num_bytes);
+            if (rc == -1){
+                perror("write");
+                syslog(LOG_DEBUG, "Closing log file\n");
+                if (close(log_file) == -1){
+                    perror("close");
+                    syslog(LOG_ERR, "Could not close log file\n");
+                    free(regbuf);
+                    return -1;
+                }
+                free(regbuf);
+                return -1;
+            }
+            syslog(LOG_DEBUG, "rc: %d, log_file: %d\n",rc, log_file);    
+            syslog(LOG_DEBUG, "Wrote %d bytes to file.\n", num_bytes);
+        } else { // errors, close log file and throw -1
+            syslog(LOG_DEBUG, "Closing log file\n");
             if (close(log_file) == -1){
                 perror("close");
                 syslog(LOG_ERR, "Could not close log file\n");
+                free(regbuf);
                 return -1;
             }
+            free(regbuf);
             return -1;
         }
-        syslog(LOG_DEBUG, "rc: %d, log_file: %d\n",rc, log_file);    
-        syslog(LOG_DEBUG, "Wrote %d bytes to file.\n", delim+1);
-    }
-    if (close(log_file) == -1){
-        perror("close");
-        syslog(LOG_ERR, "Could not close log file\n");
-        return -1;
+
     }
     return 0;
 }
 
-int sock_send(int log_file, int client_fd){
-    log_file = open(LOG_FILE, O_CREAT | O_RDWR | O_NONBLOCK, 0777);
-    if (log_file == -1) {
-        perror("open");
-        syslog(LOG_ERR, "Could not access %s\n", LOG_FILE);
-        return -1;
-    }
-
+int sock_send(int log_file, int client_fd, int seek_arg){
     char buf[1024];
     memset(buf,0,1024);
     int read_count = 1024;
-    lseek(log_file,0,SEEK_SET);
+    lseek(log_file,0,seek_arg);
     while (read_count > 0){
         int read_count = read(log_file, buf, sizeof(buf)-1);
         syslog(LOG_DEBUG, "read_count: %d, log_file: %d, client_fd: %d\n",read_count, log_file, client_fd);
@@ -103,6 +146,7 @@ int sock_send(int log_file, int client_fd){
         int sent_bytes = send(client_fd, buf, read_count,0);
         if (sent_bytes == -1){
             perror("send");
+            syslog(LOG_DEBUG, "Closing log file\n");
             if (close(log_file) == -1){
                 perror("close");
                 syslog(LOG_ERR, "Could not close log file\n");
@@ -111,11 +155,6 @@ int sock_send(int log_file, int client_fd){
             return -1;
         }
         syslog(LOG_DEBUG, "Sent %d bytes back.\n", sent_bytes);
-    }
-    if (close(log_file) == -1){
-        perror("close");
-        syslog(LOG_ERR, "Could not close log file\n");
-        return -1;
     }
     return 0;
 }
@@ -132,6 +171,7 @@ void signal_handler(int signal_number){
             syslog(LOG_DEBUG, "Unlinked log file\n");
         }
         #endif
+        syslog(LOG_DEBUG, "Closing log file\n");
         if (close(log_file) == -1){
             syslog(LOG_ERR, "Could not close log file\n");
         }
@@ -146,6 +186,7 @@ void signal_handler(int signal_number){
             syslog(LOG_DEBUG, "Unlinked log file\n");
         }
         #endif
+        syslog(LOG_DEBUG, "Closing log file\n");
         if (close(log_file) == -1){
             syslog(LOG_ERR, "Could not close log file\n");
         }
@@ -235,17 +276,27 @@ void* thread_job(void* t_args) {
         return (void *)NULL;
     }
     syslog(LOG_DEBUG, "Thread %ld has lock\n", pthread_self());
-    // recv, send
+    
+    // recv---------------------------------------------------------------
     rc = sock_recv(args->log_file, client_fd);
+    syslog(LOG_DEBUG, "Thread wrote to fd %d\n", args->log_file);
     if (rc == -1){
         syslog(LOG_ERR, "Could not receive from %d\n", client_fd);
+    } else if (rc == 2){
+        //ioctl time
+        rc = sock_send(args->log_file, client_fd, SEEK_CUR);
+        if (rc == -1){
+            syslog(LOG_ERR, "Could not send to %d\n", client_fd);
+        }
+    } else {
+        // send---------------------------------------------------------------
+        rc = sock_send(args->log_file, client_fd, SEEK_SET);
+        if (rc == -1){
+            syslog(LOG_ERR, "Could not send to %d\n", client_fd);
+        }
+        syslog(LOG_DEBUG, "Thread read from fd %d\n", args->log_file);
     }
-    syslog(LOG_DEBUG, "Thread wrote to fd %d\n", log_file);
-    rc = sock_send(args->log_file, client_fd);
-    if (rc == -1){
-        syslog(LOG_ERR, "Could not send to %d\n", client_fd);
-    }
-    syslog(LOG_DEBUG, "Thread read from fd %d\n", log_file);
+    
     close(client_fd);
     //unlock mutex
     rc = pthread_mutex_unlock(args->file_lock);
@@ -323,7 +374,13 @@ int perform_socket_actions(int log_file, int listen_backlog) {
         } else {
             syslog(LOG_DEBUG, "Accepted connection from %d\n", client_fd);
         }
-        
+        log_file = open(LOG_FILE, O_CREAT | O_RDWR | O_NONBLOCK, 0777);
+        if (log_file == -1) {
+            perror("open");
+            syslog(LOG_ERR, "Could not access %s\n", LOG_FILE);
+            return -1;
+        }
+    
         struct entry* node = (struct entry *)malloc(sizeof(struct entry));
         node->client_fd = client_fd;
         node->log_file = log_file;
@@ -391,6 +448,7 @@ int main(int argc, char *argv[]){
             perror("sigaction");
             return -1;
     }
+
 
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_INET;

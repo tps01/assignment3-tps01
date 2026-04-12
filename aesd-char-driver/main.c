@@ -18,6 +18,7 @@
 #include <linux/cdev.h>
 #include <linux/fs.h> // file_operations, fixed size llseek
 #include <linux/slab.h>
+#include <linux/mutex.h>
 #include "aesdchar.h"
 #include "aesd_ioctl.h"
 
@@ -47,6 +48,38 @@ int aesd_release(struct inode *inode, struct file *filp)
     return 0;
 }
 
+int aesd_adjust_file_offset(struct file *filp, uint32_t write_cmd, uint32_t write_cmd_offset){
+    // this function assumes the device was locked outside it.
+    size_t offset_return;
+    loff_t f_pos = 0;
+    struct aesd_dev *dev = filp->private_data;
+    struct aesd_circular_buffer *buffer = &dev->buffer;
+    struct aesd_buffer_entry *temp_entry;
+    PDEBUG("adj_off: write_cmd: %d\n", write_cmd);
+    PDEBUG("adj_off: write_cmd_offset: %d\n", write_cmd_offset);
+    int i; // declrating i up here because of c99 features being unsupported
+    for (i=0; i < AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED; i++) {
+        temp_entry = aesd_circular_buffer_find_entry_offset_for_fpos(buffer, f_pos, &offset_return);
+        if (temp_entry) {
+            PDEBUG("adj_off: Found entry with offset %ld\n", offset_return);
+            if (i == write_cmd) { // we are at the entry we want
+                PDEBUG("adj_off: Found correct entry\n");
+                f_pos += write_cmd_offset; // just go out a certain number of desired bytes
+                break;
+            } else { // at an earlier entry
+                f_pos += temp_entry->size; // just push f_pos to next entry
+            }
+        } else {
+            return -EINVAL; // seek too far out, the entry was null
+        }
+
+    }
+    PDEBUG("adj_off: New offset %ld\n", f_pos);
+    filp->f_pos = f_pos;
+    return 0;
+}
+
+
 ssize_t aesd_read(struct file *filp, char __user *buf, size_t count,
                 loff_t *f_pos)
 {
@@ -56,7 +89,7 @@ ssize_t aesd_read(struct file *filp, char __user *buf, size_t count,
     struct aesd_buffer_entry *temp_entry;
     size_t offset_return;
 
-    mutex_lock(&dev->lock);
+    mutex_lock_interruptible(&dev->lock);
     PDEBUG("Locked mutex for read\n");
 
     //get entry
@@ -101,7 +134,9 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
     struct aesd_dev *dev = filp->private_data;
     struct aesd_circular_buffer *buffer = &dev->buffer;
 
-    mutex_lock(&dev->lock);
+    if (mutex_lock_interruptible(&dev->lock)){
+        return -ERESTARTSYS;
+    }
     //filp->private_data is the buffer set up in open().
     PDEBUG("Locked mutex for write\n");
 
@@ -112,15 +147,15 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
 
     if (dev->we.buffptr == NULL){ //no data
         PDEBUG("No data in buffer\n");
-        dev->we.buffptr = (char *)kmalloc(count,GFP_KERNEL);
+        dev->we.buffptr = (char *)kmalloc(count+1,GFP_KERNEL);
         dev->we.size = 0;
     } else { //already data from previous writes
         PDEBUG("Data already in buffer\n");
-        dev->we.buffptr = (char *)krealloc(dev->we.buffptr,count+dev->we.size,GFP_KERNEL);
+        dev->we.buffptr = (char *)krealloc(dev->we.buffptr,count+dev->we.size+1,GFP_KERNEL);
     }
 
     PDEBUG("Getting user buffer contents\n");
-    copy_from_user(dev->we.buffptr + dev->we.size, buf, count);
+    copy_from_user(dev->we.buffptr + dev->we.size, buf, count+1);
     dev->we.size = count+dev->we.size;
     retval = count; // originally had = dev->we.size, but due to the above line that would be 
     //greater than the count passed by echo and it would error out. (This function still worked though)
@@ -132,6 +167,7 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
         PDEBUG("Newline detected, adding to circular buffer\n");
         aesd_circular_buffer_add_entry(buffer, &dev->we);
         PDEBUG("Added to buffer\n");
+        PDEBUG("Buffer: %s\n", dev->we.buffptr);
         *f_pos = *f_pos + dev->we.size;
         dev->we.buffptr = NULL; // reset the working entry
         dev->we.size = 0;
@@ -151,39 +187,40 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
 
 long aesd_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
-
+    PDEBUG("In aesd_ioctl\n"); // just to help with debug greps on dmesg -W
 	int err = 0, tmp;
 	int retval = 0;
     
-
 	if (_IOC_TYPE(cmd) != AESD_IOC_MAGIC) return -ENOTTY;
 	if (_IOC_NR(cmd) > AESD_IOC_MAGIC) return -ENOTTY;
 
-	if (_IOC_DIR(cmd) & _IOC_READ)
-		err = !access_ok_wrapper(VERIFY_WRITE, (void __user *)arg, _IOC_SIZE(cmd));
-	else if (_IOC_DIR(cmd) & _IOC_WRITE)
-		err =  !access_ok_wrapper(VERIFY_READ, (void __user *)arg, _IOC_SIZE(cmd));
-	if (err) return -EFAULT;
+	// if (_IOC_DIR(cmd) & _IOC_READ)
+	// 	err = !access_ok_wrapper(VERIFY_WRITE, (void __user *)arg, _IOC_SIZE(cmd));
+	// else if (_IOC_DIR(cmd) & _IOC_WRITE)
+	// 	err =  !access_ok_wrapper(VERIFY_READ, (void __user *)arg, _IOC_SIZE(cmd));
+	// if (err) return -EFAULT;
 
 	switch(cmd) {
 	  case AESDCHAR_IOCSEEKTO:
         struct aesd_dev *dev = filp->private_data;
         struct aesd_circular_buffer *buffer = &dev->buffer;
-        struct aesd_seekto *seekto;
-        mutex_lock(&dev->lock);
-        seekto = (struct aesd_seekto *)kmalloc(sizeof(struct aesd_seekto), GFP_KERNEL);
-        copy_from_user(seekto, &arg, sizeof(struct aesd_seekto));
-        PDEBUG("our seekto cmd: %d, offset: %d\n", seekto->write_cmd, seekto->write_cmd_offset);
-
-
-        kfree(seekto);
+        struct aesd_seekto seekto;
+        struct aesd_buffer_entry *temp_entry;
+        mutex_lock_interruptible(&dev->lock);
+        if (copy_from_user(&seekto, (const void __user *)arg, sizeof(seekto)) != 0){
+            retval = EFAULT;
+        } else {
+            PDEBUG("aesd_ioctl: our seekto cmd: %d, offset: %d\n", seekto.write_cmd, seekto.write_cmd_offset);
+            retval = aesd_adjust_file_offset(filp, seekto.write_cmd, seekto.write_cmd_offset);
+            PDEBUG("aesd_ioctl: new filp offset: %d\n", filp->f_pos);
+        }
+        
         mutex_unlock(&dev->lock);
 		break;
 	  default:  /* redundant, as cmd was checked against MAXNR */
 		return -ENOTTY;
 	}
 	return retval;
-
 }
 
 
@@ -195,26 +232,29 @@ loff_t aesd_llseek(struct file *filp, loff_t off, int whence)
 	loff_t newpos;
     size_t offset_return;
     loff_t f_pos = 0;
-    size_t total_size = 0;
-
+    loff_t total_size = 0;
+    PDEBUG("llseek offset %lld whence %d", off, whence);
     //lock device
-    mutex_lock(&dev->lock);
+    mutex_lock_interruptible(&dev->lock);
     PDEBUG("Locked mutex for llseek\n");
     //get size of each entry
     int i; // declrating i up here because of c99 features being unsupported
     for (i=0; i < AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED; i++) {
-        temp_entry = aesd_circular_buffer_find_entry_offset_for_fpos(buffer, f_pos, &offset_return);
+        temp_entry = aesd_circular_buffer_find_entry_offset_for_fpos(buffer, off, &offset_return);
         if (temp_entry) {
             PDEBUG("Found entry with offset %ld\n", offset_return);
             total_size += temp_entry->size;
             f_pos += temp_entry->size;
-            PDEBUG("New total size and offset %ld, %ld\n", total_size, f_pos);
         } else {
+            PDEBUG("Entry empty, unocked mutex in llseek\n");
+            mutex_unlock(&dev->lock);
             return -EINVAL; // seek too far out, the entry was null
         }
     }
     //do the thing
+    PDEBUG("New total size and offset %ld, %ld\n", total_size, f_pos);
 	newpos = fixed_size_llseek(filp, off, whence, total_size);
+    PDEBUG("f_pos after llseek: %d\n", filp->f_pos);
     //unlock
     mutex_unlock(&dev->lock);
     PDEBUG("unlocked mutex after llseek\n");

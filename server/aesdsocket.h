@@ -11,6 +11,7 @@
 #include <signal.h>
 #include <stdbool.h>
 #include <pthread.h>
+#include <regex.h>
 #include "queue.h"
 #include "time_functions_shared.h"
 #define _GNU_SOURCE
